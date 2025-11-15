@@ -1,0 +1,114 @@
+name: Panther-X2 Armbian (Debian Trixie + 6.1 LTS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      fresh_build:
+        description: 'Clean build (ignore all caches)'
+        required: false
+        type: boolean
+        default: false
+  push:
+    branches: [ main ]
+    paths:
+      - 'config/boards/panther-x2.conf'
+      - '.github/workflows/panther-x2_trixie_6.1.yml'
+
+env:
+  # 核心构建参数
+  BOARD: panther-x2
+  BRANCH: current
+  KERNEL_VERSION: "6.1.90"  # 明确指定内核版本
+  RELEASE: trixie
+  BUILD_TYPE: cli
+  BUILD_MINIMAL: "yes"
+
+  # 硬件关键配置
+  LINUXFAMILY: meson-sm1
+  BOOT_FDT_FILE: amlogic/meson-sm1-x96-air.dtb
+  SERIALCON: "ttyAML0,115200n8"
+  BUILD_OPTIONS: "use_ccache=yes,compress_ramdisk=yes,no_early_build_success_check=yes"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: debian:bookworm
+    timeout-minutes: 420  # 7小时超时
+
+    steps:
+    - name: Checkout with Full History
+      uses: actions/checkout@v4
+      with:
+        path: build
+        fetch-depth: 0  # 获取完整提交历史
+
+    - name: Setup Advanced Build Environment
+      run: |
+        apt-get update
+        apt-get install -y --no-install-recommends \
+          git ca-certificates gnupg lsb-release \
+          device-tree-compiler bison flex u-boot-tools \
+          python3-pip rsync pv bc kmod lz4 zstd \
+          debootstrap qemu-user-static binfmt-support
+
+    - name: Configure Panther-X2 Special Settings
+      run: |
+        mkdir -p build/userpatches
+        # 内核锁定配置
+        cat <<EOF > build/userpatches/lib.config
+        KERNELBRANCH='tag:v${{ env.KERNEL_VERSION }}'
+        LINUXFAMILY='${{ env.LINUXFAMILY }}'
+        BOOT_FDT_FILE='${{ env.BOOT_FDT_FILE }}'
+        SERIALCON='${{ env.SERIALCON }}'
+        IMAGE_PARTITION_TABLE='gpt'
+        KERNEL_BUILD_TIMEOUT=180
+        EOF
+
+        # Debian Trixie 优化配置
+        cat <<'EOF' > build/userpatches/customize-image.sh
+        #!/bin/bash
+        # 设置中国时区
+        ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+        
+        # 优化软件源配置
+        cat > /etc/apt/sources.list <<SOURCES_EOF
+        deb https://mirrors.ustc.edu.cn/debian trixie main contrib non-free
+        deb https://mirrors.ustc.edu.cn/debian-security trixie-security main
+        deb https://mirrors.ustc.edu.cn/debian trixie-updates main
+        SOURCES_EOF
+        
+        # 预装关键工具
+        apt-get update && apt-get install -y \
+          armbian-zsh neofetch iperf3 lm-sensors \
+          usbutils pciutils linux-image-${{ env.KERNEL_VERSION }}-meson-sm1
+        EOF
+        chmod +x build/userpatches/customize-image.sh
+
+    - name: Run Optimized Build
+      run: |
+        cd build
+        ./compile.sh \
+          BOARD="${{ env.BOARD }}" \
+          BRANCH="${{ env.BRANCH }}" \
+          RELEASE="${{ env.RELEASE }}" \
+          BUILD_TYPE="${{ env.BUILD_TYPE }}" \
+          BUILD_MINIMAL="${{ env.BUILD_MINIMAL }}" \
+          BUILD_OPTIONS="${{ env.BUILD_OPTIONS }}"
+
+    - name: Generate Build Report
+      run: |
+        cd build/output/images
+        echo "Build Summary:" > build-info.txt
+        echo "- Kernel: $(ls *.img | grep -oP '\d+\.\d+\.\d+' | head -1)" >> build-info.txt
+        echo "- Date: $(date '+%Y-%m-%d %H:%M:%S')" >> build-info.txt
+        sha256sum Armbian_*.img.xz >> build-info.txt
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: Armbian_Trixie_6.1_PantherX2_$(date +%Y%m%d)
+        path: |
+          build/output/images/Armbian_*.img.xz
+          build/output/images/build-info.txt
+          build/output/images/Armbian_*.sha
+        retention-days: 7
