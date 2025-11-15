@@ -1,88 +1,80 @@
-name: Build Armbian (Debian 13 + 6.1) for Panther-X2
+name: Panther-X2 Armbian (Debian Trixie + 6.1 LTS)
 
 on:
   workflow_dispatch:
     inputs:
-      force_clean:
-        description: 'Force clean build (ignore cache)'
+      fresh_build:
+        description: 'Clean build (ignore all caches)'
         required: false
         type: boolean
         default: false
-  push:
-    branches: [ main ]
-    paths:
-      - 'config/boards/panther-x2.conf'
-      - '.github/workflows/panther-x2-debian13-6.1.yml'
 
 env:
-  # 核心构建参数
   BOARD: panther-x2
-  BRANCH: current               # 使用 current 分支框架
-  KERNELBRANCH: "branch:linux-6.1.y"  # 强制锁定 6.1 LTS 内核
-  RELEASE: trixie               # Debian 13 代号
-  BUILD_TYPE: cli               # cli/desktop
-  DESKTOP_ENVIRONMENT: xfce     # 当 BUILD_TYPE=desktop 时生效
-  BUILD_MINIMAL: "yes"          # 生成最小化系统
-  BUILD_OPTIONS: "use_ccache=yes,compress_ramdisk=yes,no_early_build_success_check=yes"
-  CLEAN_LEVEL: "make,debs"      # 保留部分缓存加速构建
+  BRANCH: current
+  KERNEL_VERSION: "6.1.y"
+  RELEASE: trixie
+  BUILD_TYPE: cli
+  BUILD_MINIMAL: "yes"
+  LINUXFAMILY: meson-sm1
+  BOOT_FDT_FILE: amlogic/meson-sm1-x96-air.dtb
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: debian:bookworm  # 使用 Debian 12 作为构建环境（兼容 Trixie）
+    container: debian:bookworm
+    timeout-minutes: 420
 
     steps:
-    - name: Checkout Armbian Build
+    - name: Checkout Repository
       uses: actions/checkout@v4
       with:
         path: build
-        fetch-depth: 0  # 获取完整 git 历史（某些补丁需要）
+        fetch-depth: 0
 
-    - name: Install Build Dependencies
+    - name: Create Non-root User and Setup Environment
       run: |
+        # 创建构建用户
+        useradd -m -s /bin/bash builder
+        chown -R builder:builder /github/workspace/build
+        
+        # 安装依赖
         apt-get update
         apt-get install -y --no-install-recommends \
           git ca-certificates gnupg lsb-release \
-          device-tree-compiler bison flex \
-          curl xz-utils pv bc kmod
+          device-tree-compiler bison flex u-boot-tools \
+          python3-pip rsync pv bc kmod lz4 zstd \
+          debootstrap qemu-user-static binfmt-support sudo
+        
+        # 允许builder用户无需密码执行sudo
+        echo "builder ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
-    - name: Configure Panther-X2 Overrides
+    - name: Configure Build Settings as Builder User
       run: |
         mkdir -p build/userpatches
-        # 内核和硬件特定配置
         cat <<EOF > build/userpatches/lib.config
-        KERNELBRANCH="${{ env.KERNELBRANCH }}"
-        LINUXFAMILY=meson-sm1
-        BOOT_FDT_FILE=amlogic/meson-sm1-x96-air.dtb
-        IMAGE_PARTITION_TABLE=gpt
-        SERIALCON="ttyAML0,115200n8"  # 指定串口配置
+        KERNELBRANCH='tag:v${{ env.KERNEL_VERSION }}'
+        LINUXFAMILY='${{ env.LINUXFAMILY }}'
+        BOOT_FDT_FILE='${{ env.BOOT_FDT_FILE }}'
+        IMAGE_PARTITION_TABLE='gpt'
         EOF
+      # 关键：切换到builder用户执行
+      run-as: builder
 
-        # 针对 Debian 13 的软件源配置
-        cat <<EOF > build/userpatches/customize-image.sh
-        #!/bin/bash
-        echo "deb http://deb.debian.org/debian trixie main contrib non-free" > /etc/apt/sources.list
-        echo "deb http://deb.debian.org/debian-security trixie-security main" >> /etc/apt/sources.list
-        echo "deb http://deb.debian.org/debian trixie-updates main" >> /etc/apt/sources.list
-        EOF
-        chmod +x build/userpatches/customize-image.sh
-
-    - name: Run Armbian Build
-      timeout-minutes: 360  # 设置 6 小时超时
+    - name: Run Armbian Build as Non-root User
       run: |
-        cd build
+        cd /github/workspace/build
         ./compile.sh \
           BOARD="${{ env.BOARD }}" \
           BRANCH="${{ env.BRANCH }}" \
           RELEASE="${{ env.RELEASE }}" \
           BUILD_TYPE="${{ env.BUILD_TYPE }}" \
-          BUILD_MINIMAL="${{ env.BUILD_MINIMAL }}" \
-          BUILD_OPTIONS="${{ env.BUILD_OPTIONS }}" \
-          CLEAN_LEVEL="${{ env.CLEAN_LEVEL }}"
+          BUILD_MINIMAL="${{ env.BUILD_MINIMAL }}"
+      # 关键：使用builder用户运行编译脚本
+      run-as: builder
 
-    - name: Upload Image Artifact
+    - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: Armbian-Debian13-6.1-PantherX2-${{ github.run_number }}
-        path: build/output/images/
-        retention-days: 7
+        name: Armbian_Trixie_6.1_PantherX2_$(date +%Y%m%d)
+        path: build/output/images/Armbian_*.img.xz
